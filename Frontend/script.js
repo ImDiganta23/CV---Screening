@@ -1,4 +1,5 @@
-const API = "http://127.0.0.1:8000";
+const API_BASE = "https://cv-screening-jt58.onrender.com";
+
 
 async function sendMessage() {
     const input = document.getElementById("chatInput");
