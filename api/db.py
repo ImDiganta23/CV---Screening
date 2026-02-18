@@ -1,11 +1,18 @@
-import sqlite3
+import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from dotenv import load_dotenv
 
-conn = sqlite3.connect("app.db", check_same_thread=False)
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 cursor = conn.cursor()
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS candidates(
-id INTEGER PRIMARY KEY AUTOINCREMENT,
+id SERIAL PRIMARY KEY,
 name TEXT,
 primary_email TEXT UNIQUE,
 phone TEXT,
@@ -41,4 +48,4 @@ created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 """)
 
 conn.commit()
-print("Database initialized")
+print("PostgreSQL initialized")
