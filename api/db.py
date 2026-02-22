@@ -10,6 +10,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 cursor = conn.cursor()
 
+# Candidates table
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS candidates(
 id SERIAL PRIMARY KEY,
@@ -26,23 +27,25 @@ created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """)
 
+# CV Extracts table
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS cv_extracts(
-id INTEGER PRIMARY KEY AUTOINCREMENT,
-candidate_id INTEGER UNIQUE,
+id SERIAL PRIMARY KEY,
+candidate_id INTEGER REFERENCES candidates(id) ON DELETE CASCADE,
 raw_text TEXT,
 extracted_json TEXT,
 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """)
 
+# Evaluations table
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS evaluations(
-id INTEGER PRIMARY KEY AUTOINCREMENT,
-candidate_id INTEGER,
+id SERIAL PRIMARY KEY,
+candidate_id INTEGER REFERENCES candidates(id) ON DELETE CASCADE,
 bucket TEXT,
 reasoning_3_bullets TEXT,
-confidence REAL,
+confidence FLOAT,
 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """)
