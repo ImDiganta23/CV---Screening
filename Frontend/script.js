@@ -1,4 +1,4 @@
-const API_BASE = "https://cv-screening-jt58.onrender.com";
+const API_BASE = "";
 
 
 async function sendMessage() {
@@ -11,7 +11,7 @@ async function sendMessage() {
     input.value = "";
 
     try {
-        const response = await fetch(`${API}/chat?query=${encodeURIComponent(message)}`);
+        const response = await fetch(`/chat?query=${encodeURIComponent(message)}`);
         let data = await response.text();
 
         // Remove wrapping quotes if present

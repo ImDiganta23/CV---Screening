@@ -11,13 +11,20 @@ import hashlib
 from pydantic import BaseModel
 from typing import List
 from fastapi.middleware.cors import CORSMiddleware
-
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 load_dotenv()
 
 MISTRAL_KEY = os.getenv("MISTRAL_API_KEY")
 print("MISTRAL KEY LOADED:", bool(MISTRAL_KEY))
 
 app = FastAPI()
+
+app.mount("/static", StaticFiles(directory="Frontend"), name="static")
+
+@app.get("/")
+def serve_frontend():
+    return FileResponse("Frontend/index.html")
 
 app.add_middleware(
     CORSMiddleware,
