@@ -351,8 +351,8 @@ def get_candidates():
         {
             "id": r["id"],
             "name": r["name"],
-            "email": r["email"],
-            "github": r["github"],
+            "email": r["primary_email"],
+            "github": r["github_url"],
             "passout_year": r["passout_year"],
             "bucket": r["bucket"],
             "reasoning": r["reasoning_3_bullets"],
