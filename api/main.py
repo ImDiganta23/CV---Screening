@@ -195,7 +195,7 @@ async def parse(file: UploadFile):
     (file_hash,)
     )
 
-    cid = cursor.fetchone()[0]
+    cid = cursor.fetchone()["id"]
 
 
 
@@ -250,13 +250,13 @@ def chat(query: str):
 
         for r in rows:
             payload.append({
-            "name": r[0],
-            "email": r[1],
-            "github": r[2],
-            "passout": r[3],
-            "bucket": r[4],
-            "reason": r[5],
-            "confidence": r[6]
+            "name": r["name"],
+            "email": r["primary_email"],
+            "github": r["github_url"],
+            "passout": r["passout_year"],
+            "bucket": r["bucket"],
+            "reason": r["reasoning_3_bullets"],
+            "confidence": r["confidence"]
         })
 
         prompt = f"""
@@ -349,14 +349,14 @@ def get_candidates():
 
     return [
         {
-            "id": r[0],
-            "name": r[1],
-            "email": r[2],
-            "github": r[3],
-            "passout_year": r[4],
-            "bucket": r[5],
-            "reasoning": r[6],
-            "confidence": r[7]
+            "id": r["id"],
+            "name": r["name"],
+            "email": r["email"],
+            "github": r["github"],
+            "passout_year": r["passout_year"],
+            "bucket": r["bucket"],
+            "reasoning": r["reasoning_3_bullets"],
+            "confidence": r["confidence"]
         }
         for r in rows
     ]
