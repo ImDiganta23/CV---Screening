@@ -45,7 +45,7 @@ id SERIAL PRIMARY KEY,
 candidate_id INTEGER REFERENCES candidates(id) ON DELETE CASCADE,
 bucket TEXT,
 reasoning_3_bullets TEXT,
-confidence FLOAT,
+confidence REAL,
 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """)

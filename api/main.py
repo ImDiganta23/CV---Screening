@@ -239,12 +239,13 @@ async def parse(file: UploadFile):
 @app.get("/chat")
 def chat(query: str):
 
-        rows = cursor.execute("""
+        cursor.execute("""
         SELECT c.name,c.primary_email,c.github_url,c.passout_year,
            e.bucket,e.reasoning_3_bullets,e.confidence
         FROM candidates c
         JOIN evaluations e ON c.id=e.candidate_id
-        """).fetchall()
+        """)
+        rows = cursor.fetchall()
 
         payload = []
 
@@ -339,17 +340,24 @@ async def sync_drive(payload: DriveSync):
 
 @app.get("/candidates")
 def get_candidates():
-    rows = cursor.execute("""
-    SELECT c.id, c.name, c.primary_email, c.github_url,
-           c.passout_year, e.bucket, e.reasoning_3_bullets,
-           e.confidence
+    cursor.execute("""
+    SELECT 
+        c.id AS candidate_id,
+        c.name,
+        c.primary_email,
+        c.github_url,
+        c.passout_year,
+        e.bucket,
+        e.reasoning_3_bullets,
+        e.confidence 
     FROM candidates c
     JOIN evaluations e ON c.id = e.candidate_id
-    """).fetchall()
+    """)
+    rows = cursor.fetchall()
 
     return [
         {
-            "id": r["id"],
+            "id": r["candidate_id"],
             "name": r["name"],
             "email": r["primary_email"],
             "github": r["github_url"],
