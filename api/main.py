@@ -170,10 +170,11 @@ async def parse(file: UploadFile):
 
     # INSERT CANDIDATE (ONLY ONCE)
     cursor.execute("""
-    INSERT OR IGNORE INTO candidates
-    (name,primary_email,phone,location_text,github_url,linkedin_url,passout_year,cv_file_name,file_hash)
-    VALUES(?,?,?,?,?,?,?,?,?)
-    """,(
+    INSERT INTO candidates
+    (name, primary_email, phone, location_text, github_url, linkedin_url, passout_year, cv_file_name, file_hash)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    ON CONFLICT (primary_email) DO NOTHING
+    """, (
     data.get("name"),
     data.get("email"),
     data.get("phone"),
@@ -190,7 +191,7 @@ async def parse(file: UploadFile):
 
     # GET CID
     cursor.execute(
-    "SELECT id FROM candidates WHERE file_hash=?",
+    "SELECT id FROM candidates WHERE file_hash=%s",
     (file_hash,)
     )
 
@@ -201,7 +202,7 @@ async def parse(file: UploadFile):
     # SAVE RAW EXTRACT
     cursor.execute("""
     INSERT INTO cv_extracts(candidate_id,raw_text,extracted_json)
-    VALUES(?,?,?)
+    VALUES(%s,%s,%s)
     """,(cid,raw_text,structured))
 
     conn.commit()
@@ -217,14 +218,14 @@ async def parse(file: UploadFile):
 
     # Delete old evaluation for this candidate
     cursor.execute(
-        "DELETE FROM evaluations WHERE candidate_id = ?",
+        "DELETE FROM evaluations WHERE candidate_id = %s",
         (cid,)
     )
     conn.commit()
 
     cursor.execute("""
     INSERT INTO evaluations(candidate_id,bucket,reasoning_3_bullets,confidence)
-    VALUES(?,?,?,?)
+    VALUES(%s,%s,%s,%s)
     """,(
     cid,
     bucket,
@@ -323,7 +324,7 @@ async def sync_drive(payload: DriveSync):
     
     if not files:
         return {"status": "no files received"}
-    placeholders = ",".join(["?"] * len(files))
+    placeholders = ",".join(["%s"] * len(files))
 
     query = f"""
     DELETE FROM candidates
