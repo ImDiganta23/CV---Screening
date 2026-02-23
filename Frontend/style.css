@@ -44,16 +44,16 @@ h1 {
 }
 
 .ai {
-    background: #e9ecef;
-    align-self: flex-start;
+        background: #e9ecef;
+        align-self: flex-start;
+    }
+
     .ai ul {
-    padding-left: 20px;
+        padding-left: 20px;
     }
 
     .ai li {
-    margin-bottom: 6px;
-    }
-
+        margin-bottom: 6px;
 }
 
 .input-area {
