@@ -1,8 +1,7 @@
 import re
-import sqlite3
 from api.bucketer import rule_score, bucket_from_score
 from fastapi import FastAPI, HTTPException, UploadFile, Query, Body
-import uuid, json, os
+import json, os
 import fitz
 import requests
 from dotenv import load_dotenv
@@ -105,7 +104,7 @@ Tasks:
 1. Summarize best evidence of hands-on building
 2. Identify missing critical info
 3. Give 3 bullet reasons for bucket
-4. Return confidence 0–1
+4. Provide reasoning only (confidence calculated separately)
 
 Return ONLY JSON:
 
@@ -157,11 +156,36 @@ async def parse(file: UploadFile):
         data = json.loads(structured)
     except Exception as e:
         print("JSON parse failed:", structured)
+
+        # Insert minimal candidate record with failure status
+        cursor.execute("""
+            INSERT INTO candidates
+            (name, primary_email, cv_file_name, file_hash, status)
+            VALUES (%s,%s,%s,%s,%s)
+                ON CONFLICT (primary_email) DO NOTHING
+                """, (
+                "Unknown",
+                None,
+                path,
+                file_hash,
+                "parse_failed"
+                ))
+        conn.commit()
+
         raise HTTPException(status_code=500, detail="Bad LLM JSON")
 
     name = data.get("name")
     email = data.get("email")
     phone = data.get("phone")
+    EMAIL_REGEX = r"^[^@]+@[^@]+\.[^@]+$"
+    PHONE_REGEX = r"\+?\d{7,15}"
+
+    if email and not re.match(EMAIL_REGEX, email):
+        email = None
+    if email and email not in raw_text:
+        email = None
+    if phone and not re.match(PHONE_REGEX, phone):
+        phone = None
     location = data.get("location")
     github = data.get("github")
     linkedin = data.get("linkedin")
@@ -182,13 +206,13 @@ async def parse(file: UploadFile):
     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
     ON CONFLICT (primary_email) DO NOTHING
     """, (
-    data.get("name"),
-    data.get("email"),
-    data.get("phone"),
-    data.get("location"),
-    data.get("github"),
-    data.get("linkedin"),
-    data.get("passout_year"),
+    name,
+    email,
+    phone,
+    location,
+    github,
+    linkedin,
+    passout_year,
     path,
     file_hash
     ))
@@ -198,19 +222,36 @@ async def parse(file: UploadFile):
 
     # GET CID
     cursor.execute(
-    "SELECT id FROM candidates WHERE file_hash=%s",
-    (file_hash,)
+        "SELECT id FROM candidates WHERE file_hash=%s",
+        (file_hash,)
     )
+    row = cursor.fetchone()
 
-    cid = cursor.fetchone()["id"]
+    if row:
+        cid = row["id"]
+    else:
+        cursor.execute(
+            "SELECT id FROM candidates WHERE primary_email=%s",
+            (email,)
+        )
+        fallback_row = cursor.fetchone()
+        if fallback_row:
+            cid = fallback_row["id"]
+        else:
+            raise HTTPException(status_code=500, detail="Candidate lookup failed")
+    
 
-
+    cursor.execute("""
+    SELECT MAX(version) FROM cv_extracts WHERE candidate_id=%s
+    """,(cid,))
+    row = cursor.fetchone()
+    version = (row["max"] or 0) + 1
 
     # SAVE RAW EXTRACT
     cursor.execute("""
-    INSERT INTO cv_extracts(candidate_id,raw_text,extracted_json)
-    VALUES(%s,%s,%s)
-    """,(cid,raw_text,structured))
+    INSERT INTO cv_extracts(candidate_id,raw_text,extracted_json,version)
+    VALUES(%s,%s,%s, %s)
+    """,(cid,raw_text,structured, version))
 
     conn.commit()
 
@@ -230,6 +271,9 @@ async def parse(file: UploadFile):
     )
     conn.commit()
 
+    max_score = 10  # total possible weight sum
+    confidence = round(min(1.0, score / max_score), 2)
+
     cursor.execute("""
     INSERT INTO evaluations(candidate_id,bucket,reasoning_3_bullets,confidence)
     VALUES(%s,%s,%s,%s)
@@ -237,37 +281,56 @@ async def parse(file: UploadFile):
     cid,
     bucket,
     "\n".join(llm_eval["bullets"]),
-    llm_eval["confidence"]
-    ))
-
+    confidence
+        ))
+    cursor.execute("UPDATE candidates SET status='processed' WHERE id=%s",(cid,))
     conn.commit()
 
     return {"candidate_id":cid}
 @app.get("/chat")
 def chat(query: str):
 
-        cursor.execute("""
-        SELECT c.name,c.primary_email,c.github_url,c.passout_year,
-           e.bucket,e.reasoning_3_bullets,e.confidence
-        FROM candidates c
-        JOIN evaluations e ON c.id=e.candidate_id
-        """)
-        rows = cursor.fetchall()
+    query_lower = query.lower()
+    where_clauses = []
 
-        payload = []
+    if "selected" in query_lower:
+        where_clauses.append("e.bucket='Selected'")
+    if "review" in query_lower:
+        where_clauses.append("e.bucket='Review'")
+    if "rejected" in query_lower:
+        where_clauses.append("e.bucket='Rejected'")
+    if "2026" in query_lower:
+        where_clauses.append("c.passout_year=2026")
+    if "github" in query_lower:
+        where_clauses.append("c.github_url IS NOT NULL")
 
-        for r in rows:
-            payload.append({
-            "name": r["name"],
-            "email": r["primary_email"],
-            "github": r["github_url"],
-            "passout": r["passout_year"],
-            "bucket": r["bucket"],
-            "reason": r["reasoning_3_bullets"],
-            "confidence": r["confidence"]
-        })
+    base_query = """
+    SELECT c.name,c.primary_email,c.github_url,c.passout_year,
+       e.bucket,e.reasoning_3_bullets,e.confidence
+    FROM candidates c
+    JOIN evaluations e ON c.id=e.candidate_id
+    """
 
-        prompt = f"""
+    if where_clauses:
+        base_query += " WHERE " + " AND ".join(where_clauses)
+
+    cursor.execute(base_query)
+    rows = cursor.fetchall()
+
+    payload = []
+
+    for r in rows:
+        payload.append({
+        "name": r["name"],
+        "email": r["primary_email"],
+        "github": r["github_url"],
+        "passout": r["passout_year"],
+        "bucket": r["bucket"],
+        "reason": r["reasoning_3_bullets"],
+        "confidence": r["confidence"]
+    })
+
+    prompt = f"""
         You are an AI recruiter assistant.
 
         User question:
@@ -302,7 +365,7 @@ def chat(query: str):
         """
         
 
-        r = requests.post(
+    r = requests.post(
         "https://api.mistral.ai/v1/chat/completions",
         headers={
             "Authorization": f"Bearer {MISTRAL_KEY}",
@@ -314,13 +377,13 @@ def chat(query: str):
         }
     )
 
-        raw_output = r.json()["choices"][0]["message"]["content"]
+    raw_output = r.json()["choices"][0]["message"]["content"]
 
         # Replace escaped newlines with actual newlines
-        clean_output = raw_output.encode().decode("unicode_escape")
-        print("FINAL OUTPUT:", clean_output)
+    clean_output = raw_output.encode().decode("unicode_escape")
+    print("FINAL OUTPUT:", clean_output)
 
-        return clean_output
+    return clean_output
 
 
 class DriveSync(BaseModel):

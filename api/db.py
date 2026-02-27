@@ -23,6 +23,7 @@ github_url TEXT,
 passout_year INTEGER,
 cv_file_name TEXT UNIQUE,
 file_hash TEXT UNIQUE,
+status TEXT DEFAULT 'processed',               
 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """)
@@ -34,6 +35,7 @@ id SERIAL PRIMARY KEY,
 candidate_id INTEGER REFERENCES candidates(id) ON DELETE CASCADE,
 raw_text TEXT,
 extracted_json TEXT,
+version INTEGER DEFAULT 1,
 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """)
