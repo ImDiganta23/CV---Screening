@@ -77,8 +77,14 @@ CV TEXT:
             "messages":[{"role":"user","content":prompt}]
         }
     )
+    if r.status_code != 200:
+        raise Exception(f"Mistral API error: {r.text}")
 
-    raw = r.json()["choices"][0]["message"]["content"]
+    resp_json = r.json()
+
+    if "choices" not in resp_json:
+        raise Exception(f"Invalid Mistral response: {resp_json}")
+    raw = resp_json["choices"][0]["message"]["content"]
 
     print("RAW RESPONSE:", raw)
 
@@ -127,8 +133,13 @@ Return ONLY JSON:
             "messages":[{"role":"user","content":prompt}]
         }
     )
+    if r.status_code != 200:
+        raise Exception(f"Mistral API error: {r.text}")
 
-    raw = r.json()["choices"][0]["message"]["content"]
+    resp_json = r.json()
+    if "choices" not in resp_json:
+        raise Exception(f"Invalid Mistral response: {resp_json}")
+    raw = resp_json["choices"][0]["message"]["content"]
 
     raw = raw[raw.find("{"):raw.rfind("}")+1]
 
@@ -136,166 +147,152 @@ Return ONLY JSON:
 
 @app.post("/parse")
 async def parse(file: UploadFile):
-
-    path = f"temp_{hashlib.md5(file.filename.encode()).hexdigest()}.pdf"
-
-    with open(path,"wb") as f:
-        f.write(await file.read())
-
-    with open(path,"rb") as f:
-        file_hash = hashlib.md5(f.read()).hexdigest()
-
-
-    raw_text = extract_text(path)
-
-    structured = call_mistral(raw_text)
-
-    if not structured:
-        return {"error": "Empty response from Mistral"}
-
     try:
-        data = json.loads(structured)
-    except Exception as e:
-        print("JSON parse failed:", structured)
+        path = f"temp_{hashlib.md5(file.filename.encode()).hexdigest()}.pdf"
 
-        # Insert minimal candidate record with failure status
+        with open(path,"wb") as f:
+            f.write(await file.read())
+
+        with open(path,"rb") as f:
+            file_hash = hashlib.md5(f.read()).hexdigest()
+
+
+        raw_text = extract_text(path)
+
+        structured = call_mistral(raw_text)
+
+        if not structured:
+            raise HTTPException(status_code=500, detail="Empty response from Mistral")
+
+        data = json.loads(structured)
+    
+
+        name = data.get("name")
+        email = data.get("email")
+        phone = data.get("phone")
+        EMAIL_REGEX = r"^[^@]+@[^@]+\.[^@]+$"
+        PHONE_REGEX = r"\+?\d{7,15}"
+
+        if email and not re.match(EMAIL_REGEX, email):
+            email = None
+        if email and email not in raw_text:
+            email = None
+        if phone and not re.match(PHONE_REGEX, phone):
+            phone = None
+        location = data.get("location")
+        github = data.get("github")
+        linkedin = data.get("linkedin")
+        passout_year = data.get("passout_year")
+
+        projects = json.dumps(data.get("projects", []))
+        skills = json.dumps(data.get("skills", []))
+        evidence = json.dumps(data.get("evidence_hints", []))
+        education = data.get("education")
+
+        # INSERT CANDIDATE (ONLY ONCE)
         cursor.execute("""
-            INSERT INTO candidates
-            (name, primary_email, cv_file_name, file_hash, status)
-            VALUES (%s,%s,%s,%s,%s)
-                ON CONFLICT (primary_email) DO NOTHING
-                """, (
-                "Unknown",
-                None,
-                path,
-                file_hash,
-                "parse_failed"
-                ))
+        INSERT INTO candidates
+        (name, primary_email, phone, location_text, github_url, linkedin_url, passout_year, cv_file_name, file_hash)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (file_hash) DO NOTHING
+        """, (
+        name,
+        email,
+        phone,
+        location,
+        github,
+        linkedin,
+        passout_year,
+        path,
+        file_hash
+        ))
+
+
         conn.commit()
 
-        raise HTTPException(status_code=500, detail="Bad LLM JSON")
-
-    name = data.get("name")
-    email = data.get("email")
-    phone = data.get("phone")
-    EMAIL_REGEX = r"^[^@]+@[^@]+\.[^@]+$"
-    PHONE_REGEX = r"\+?\d{7,15}"
-
-    if email and not re.match(EMAIL_REGEX, email):
-        email = None
-    if email and email not in raw_text:
-        email = None
-    if phone and not re.match(PHONE_REGEX, phone):
-        phone = None
-    location = data.get("location")
-    github = data.get("github")
-    linkedin = data.get("linkedin")
-    passout_year = data.get("passout_year")
-
-    projects = json.dumps(data.get("projects", []))
-    skills = json.dumps(data.get("skills", []))
-    evidence = json.dumps(data.get("evidence_hints", []))
-    education = data.get("education")
-
-    os.remove(path)
-
-
-    # INSERT CANDIDATE (ONLY ONCE)
-    cursor.execute("""
-    INSERT INTO candidates
-    (name, primary_email, phone, location_text, github_url, linkedin_url, passout_year, cv_file_name, file_hash)
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    ON CONFLICT (primary_email) DO NOTHING
-    """, (
-    name,
-    email,
-    phone,
-    location,
-    github,
-    linkedin,
-    passout_year,
-    path,
-    file_hash
-    ))
-
-
-    conn.commit()
-
-    # GET CID
-    cursor.execute(
-        "SELECT id FROM candidates WHERE file_hash=%s",
-        (file_hash,)
-    )
-    row = cursor.fetchone()
-
-    if row:
-        cid = row["id"]
-    else:
+        # GET CID
         cursor.execute(
-            "SELECT id FROM candidates WHERE primary_email=%s",
-            (email,)
-        )
-        fallback_row = cursor.fetchone()
-        if fallback_row:
-            cid = fallback_row["id"]
+            "SELECT id FROM candidates WHERE file_hash=%s",
+            (file_hash,)
+     )
+        row = cursor.fetchone()
+
+        if row:
+            cid = row["id"]
         else:
-            raise HTTPException(status_code=500, detail="Candidate lookup failed")
+            cursor.execute(
+                "SELECT id FROM candidates WHERE primary_email=%s",
+                (email,)
+            )
+            fallback_row = cursor.fetchone()
+            if fallback_row:
+                cid = fallback_row["id"]
+            else:
+                raise HTTPException(status_code=500, detail="Candidate lookup failed")
     
 
-    cursor.execute("""
-    SELECT MAX(version) FROM cv_extracts WHERE candidate_id=%s
-    """,(cid,))
-    row = cursor.fetchone()
-    version = (row["max"] or 0) + 1
+        cursor.execute("""
+        SELECT MAX(version) FROM cv_extracts WHERE candidate_id=%s
+        """,(cid,))
+        row = cursor.fetchone()
+        if row and list(row.values())[0] is not None:
+            version = list(row.values())[0] + 1
+        else:
+            version = 1
 
-    # SAVE RAW EXTRACT
-    cursor.execute("""
-    INSERT INTO cv_extracts(candidate_id,raw_text,extracted_json,version)
-    VALUES(%s,%s,%s, %s)
-    """,(cid,raw_text,structured, version))
+        # SAVE RAW EXTRACT
+        cursor.execute("""
+        INSERT INTO cv_extracts(candidate_id,raw_text,extracted_json,version)
+        VALUES(%s,%s,%s, %s)
+        """,(cid,raw_text,structured, version))
 
-    conn.commit()
+        conn.commit()
 
     
-   # BUCKETING
-    from api.bucketer import rule_signals
+        # BUCKETING
 
-    signals = rule_signals(data)
-    score = rule_score(signals)
-    bucket = bucket_from_score(score)
+        signals = rule_signals(data)
+        score = rule_score(signals)
+        bucket = bucket_from_score(score)
 
-    max_score = 10
-    confidence = round(min(1.0, score / max_score), 2)
+        max_score = 10
+        confidence = round(min(1.0, score / max_score), 2)
 
-    llm_eval = {
-        "bullets": [
-            f"Rule score: {score}",
-            f"ML detected: {signals.get('has_ml')}",
-            f"Deployment detected: {signals.get('has_deployment')}"
-        ],
-        "missing": ""
-    }
+        llm_eval = {
+            "bullets": [
+                f"Rule score: {score}",
+                f"ML detected: {signals.get('has_ml')}",
+                f"Deployment detected: {signals.get('has_deployment')}"
+            ],
+            "missing": ""
+        }
 
-# Delete old evaluation for this candidate
-    cursor.execute(
-    "DELETE FROM evaluations WHERE candidate_id = %s",
-    (cid,)
-    )
-    conn.commit()
+        # Delete old evaluation for this candidate
+        cursor.execute(
+            "DELETE FROM evaluations WHERE candidate_id = %s",
+            (cid,)
+        )
+        conn.commit()
 
-    cursor.execute("""
-    INSERT INTO evaluations(candidate_id,bucket,reasoning_3_bullets,confidence)
-    VALUES(%s,%s,%s,%s)
-    """,(
-    cid,
-    bucket,
-    "\n".join(llm_eval["bullets"]),
-    confidence
+        cursor.execute("""
+        INSERT INTO evaluations(candidate_id,bucket,reasoning_3_bullets,confidence)
+        VALUES(%s,%s,%s,%s)
+        """,(
+            cid,
+            bucket,
+            "\n".join(llm_eval["bullets"]),
+            confidence
         ))
-    cursor.execute("UPDATE candidates SET status='processed' WHERE id=%s",(cid,))
-    conn.commit()
-
-    return {"candidate_id":cid}
+        cursor.execute(
+            "UPDATE candidates SET status='processed' WHERE id=%s",
+            (cid,)
+        )
+        conn.commit()
+        os.remove(path)
+        return {"candidate_id":cid}
+    except Exception as e:
+        print("PARSE ERROR:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 @app.get("/chat")
 def chat(query: str):
 
@@ -450,7 +447,7 @@ def get_candidates():
 
 @app.get("/debug_evaluations")
 def debug_evaluations():
-    rows = cursor.execute("""
+    cursor.execute("""
     SELECT candidate_id, COUNT(*)
     FROM evaluations
     GROUP BY candidate_id
