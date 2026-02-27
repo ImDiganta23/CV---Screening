@@ -292,6 +292,7 @@ async def parse(file: UploadFile):
         return {"candidate_id":cid}
     except Exception as e:
         print("PARSE ERROR:", str(e))
+        conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 @app.get("/chat")
 def chat(query: str):
