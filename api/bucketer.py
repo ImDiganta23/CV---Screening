@@ -45,7 +45,17 @@ def keyword_match(text, keywords):
 def rule_signals(data):
 
     skills_text = " ".join(data.get("skills", [])).lower()
-    projects_text = " ".join(data.get("projects", [])).lower()
+    projects = data.get("projects", [])
+    projects_text = ""
+
+    for p in projects:
+        if isinstance(p, dict):
+            projects_text += " " + p.get("title", "")
+            projects_text += " " + p.get("description", "")
+        elif isinstance(p, str):
+            projects_text += " " + p
+
+    projects_text = projects_text.lower()
     education_text = str(data.get("education", "")).lower()
 
     full_text = skills_text + " " + projects_text
