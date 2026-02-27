@@ -12,6 +12,7 @@ from typing import List
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from api.bucketer import rule_signals
 load_dotenv()
 
 MISTRAL_KEY = os.getenv("MISTRAL_API_KEY")
@@ -136,7 +137,7 @@ Return ONLY JSON:
 @app.post("/parse")
 async def parse(file: UploadFile):
 
-    path = file.filename
+    path = f"temp_{hashlib.md5(file.filename.encode()).hexdigest()}.pdf"
 
     with open(path,"wb") as f:
         f.write(await file.read())
@@ -255,24 +256,32 @@ async def parse(file: UploadFile):
 
     conn.commit()
 
-    # BUCKETING
+    
+   # BUCKETING
     from api.bucketer import rule_signals
 
     signals = rule_signals(data)
     score = rule_score(signals)
     bucket = bucket_from_score(score)
 
-    llm_eval = llm_judgement(data, signals)
+    max_score = 10
+    confidence = round(min(1.0, score / max_score), 2)
 
-    # Delete old evaluation for this candidate
+    llm_eval = {
+        "bullets": [
+            f"Rule score: {score}",
+            f"ML detected: {signals.get('has_ml')}",
+            f"Deployment detected: {signals.get('has_deployment')}"
+        ],
+        "missing": ""
+    }
+
+# Delete old evaluation for this candidate
     cursor.execute(
-        "DELETE FROM evaluations WHERE candidate_id = %s",
-        (cid,)
+    "DELETE FROM evaluations WHERE candidate_id = %s",
+    (cid,)
     )
     conn.commit()
-
-    max_score = 10  # total possible weight sum
-    confidence = round(min(1.0, score / max_score), 2)
 
     cursor.execute("""
     INSERT INTO evaluations(candidate_id,bucket,reasoning_3_bullets,confidence)
@@ -399,7 +408,7 @@ async def sync_drive(payload: DriveSync):
 
     query = f"""
     DELETE FROM candidates
-    WHERE cv_File_name NOT IN ({placeholders})
+    WHERE cv_file_name NOT IN ({placeholders})
     """
 
     cursor.execute(query, files)
@@ -445,8 +454,8 @@ def debug_evaluations():
     SELECT candidate_id, COUNT(*)
     FROM evaluations
     GROUP BY candidate_id
-    """).fetchall()
-
+    """)
+    rows = cursor.fetchall()
     return rows
 @app.post("/cleanup_duplicates")
 def cleanup_duplicates():
