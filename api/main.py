@@ -234,7 +234,7 @@ async def parse(file: UploadFile):
         """, (cid, raw_text, structured))
 
         # Run bucketer
-        signals = rule_signals(data)
+        signals = rule_signals(raw_text)
         score = rule_score(signals)
         bucket = bucket_from_score(score)
         confidence = round(min(1.0, score / 10), 2)
