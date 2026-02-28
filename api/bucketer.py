@@ -183,9 +183,9 @@ def rule_score(signals):
 
 def bucket_from_score(score):
 
-    if score >= 7:
+    if score >= 6:
         return "Selected"
-    elif score >= 4:
+    elif score >= 3:
         return "Review"
     else:
         return "Rejected"

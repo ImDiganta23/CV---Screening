@@ -47,7 +47,7 @@ def extract_text(path):
 
 
 # -------------------------------------------------
-# SAFE LLM CV PARSER
+# ENHANCED LLM CV PARSER (PROJECT GUIDELINE COMPLIANT)
 # -------------------------------------------------
 
 def call_mistral_parser(text):
@@ -57,26 +57,50 @@ def call_mistral_parser(text):
 
     schema = """
 {
-  "name": "",
-  "email": "",
-  "phone": "",
-  "location": "",
-  "github": "",
-  "linkedin": "",
-  "passout_year": null,
-  "education": "",
-  "projects": [],
-  "skills": []
+  "candidate": {
+    "name": "",
+    "emails": [],
+    "phones": [],
+    "location": ""
+  },
+  "education": [
+    {
+      "degree": "",
+      "institute": "",
+      "passout_year": ""
+    }
+  ],
+  "skills": {
+    "programming": [],
+    "ml_keywords": [],
+    "genai_keywords": [],
+    "tools": []
+  },
+  "projects": [
+    {
+      "title": "",
+      "summary": ""
+    }
+  ],
+  "links": {
+    "github": "",
+    "linkedin": "",
+    "portfolio": ""
+  },
+  "evidence_hints": []
 }
 """
 
     prompt = f"""
 Extract structured CV data.
 
-Rules:
+STRICT RULES:
 - Return ONLY valid JSON.
 - Do NOT hallucinate fields.
-- If not explicitly present, return null.
+- If information is not present, return empty string or empty list.
+- Extract 2-4 strongest projects only.
+- Evidence hints include keywords like:
+  deployed, api, llm, rag, fastapi, automation, docker, streamlit
 
 Schema:
 {schema}
@@ -113,7 +137,7 @@ CV TEXT:
 
 
 # -------------------------------------------------
-# PARSE ENDPOINT (Production Safe)
+# PARSE ENDPOINT (Production Safe + Full Extraction)
 # -------------------------------------------------
 
 @app.post("/parse")
@@ -140,28 +164,23 @@ async def parse(file: UploadFile):
         )
         existing = cursor.fetchone()
 
+        structured = call_mistral_parser(raw_text)
+        structured_json = json.loads(structured)
+
+        # Extract normalized fields
+        candidate = structured_json.get("candidate", {})
+        links = structured_json.get("links", {})
+
+        name = candidate.get("name")
+        email = (candidate.get("emails") or [None])[0]
+        phone = (candidate.get("phones") or [None])[0]
+        location = candidate.get("location")
+        github = links.get("github")
+        linkedin = links.get("linkedin")
+
         if existing:
             cid = existing["id"]
-            cursor.execute("""
-                INSERT INTO cv_extracts(candidate_id, raw_text, extracted_json)
-                VALUES (%s,%s,%s)
-            """, (cid, raw_text, None))
-
         else:
-            structured = call_mistral_parser(raw_text)
-            data = json.loads(structured)
-
-            email = data.get("email")
-            phone = data.get("phone")
-
-            EMAIL_REGEX = r"^[^@]+@[^@]+\.[^@]+$"
-            PHONE_REGEX = r"\+?\d{7,15}"
-
-            if email and not re.match(EMAIL_REGEX, email):
-                email = None
-            if phone and not re.match(PHONE_REGEX, phone):
-                phone = None
-
             cursor.execute("""
                 INSERT INTO candidates
                 (name, primary_email, phone, location_text, github_url,
@@ -169,23 +188,24 @@ async def parse(file: UploadFile):
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 RETURNING id
             """, (
-                data.get("name"),
+                name,
                 email,
                 phone,
-                data.get("location"),
-                data.get("github"),
-                data.get("linkedin"),
-                data.get("passout_year"),
+                location,
+                github,
+                linkedin,
+                None,
                 file.filename,
                 file_hash
             ))
 
             cid = cursor.fetchone()["id"]
 
-            cursor.execute("""
-                INSERT INTO cv_extracts(candidate_id, raw_text, extracted_json)
-                VALUES (%s,%s,%s)
-            """, (cid, raw_text, structured))
+        # Store extract version
+        cursor.execute("""
+            INSERT INTO cv_extracts(candidate_id, raw_text, extracted_json)
+            VALUES (%s,%s,%s)
+        """, (cid, raw_text, json.dumps(structured_json)))
 
         # Deterministic scoring
         signals = rule_signals(raw_text)
@@ -220,7 +240,7 @@ async def parse(file: UploadFile):
 
 
 # -------------------------------------------------
-# GET ALL CANDIDATES (Raw JSON)
+# GET ALL CANDIDATES (With Structured JSON)
 # -------------------------------------------------
 
 @app.get("/candidates")
@@ -232,41 +252,32 @@ def get_candidates():
     cursor.execute("""
         SELECT c.name,
                c.primary_email,
+               c.phone,
+               c.location_text,
                c.github_url,
-               c.passout_year,
+               c.linkedin_url,
                e.bucket,
-               e.reasoning_3_bullets,
-               e.confidence
+               e.confidence,
+               x.extracted_json
         FROM candidates c
         JOIN evaluations e ON c.id = e.candidate_id
+        JOIN cv_extracts x ON c.id = x.candidate_id
         ORDER BY c.created_at DESC
     """)
 
     rows = cursor.fetchall()
+
+    result = []
+    for r in rows:
+        item = dict(r)
+        if item["extracted_json"]:
+            item["extracted_json"] = json.loads(item["extracted_json"])
+        result.append(item)
+
     cursor.close()
     conn.close()
 
-    return rows
-
-
-# -------------------------------------------------
-# DETERMINISTIC FORMATTER
-# -------------------------------------------------
-
-def format_candidates(data):
-
-    lines = ["Here are all the candidates:\n"]
-
-    for i, row in enumerate(data, 1):
-        lines.append(f"{i}. {row['name']}")
-        lines.append(f"- Email: {row['primary_email'] or 'Not available'}")
-        lines.append(f"- GitHub: {row['github_url'] or 'Not available'}")
-        lines.append(f"- Passout Year: {row['passout_year'] or 'Not available'}")
-        lines.append(f"- Bucket: {row['bucket']}")
-        lines.append(f"- Confidence: {row['confidence']}")
-        lines.append("")
-
-    return "\n".join(lines)
+    return result
 
 
 # -------------------------------------------------
@@ -317,7 +328,7 @@ Provide a clear answer.
 
 
 # -------------------------------------------------
-# CHAT ENDPOINT (Hybrid)
+# CHAT ENDPOINT
 # -------------------------------------------------
 
 @app.get("/chat")
@@ -330,13 +341,16 @@ def chat(query: str):
         cursor.execute("""
             SELECT c.name,
                    c.primary_email,
+                   c.phone,
+                   c.location_text,
                    c.github_url,
-                   c.passout_year,
+                   c.linkedin_url,
                    e.bucket,
-                   e.reasoning_3_bullets,
-                   e.confidence
+                   e.confidence,
+                   x.extracted_json
             FROM candidates c
             JOIN evaluations e ON c.id = e.candidate_id
+            JOIN cv_extracts x ON c.id = x.candidate_id
             ORDER BY c.created_at DESC
         """)
 
@@ -345,13 +359,13 @@ def chat(query: str):
         if not rows:
             return "No candidates found."
 
-        data = [dict(r) for r in rows]
+        data = []
+        for r in rows:
+            item = dict(r)
+            if item["extracted_json"]:
+                item["extracted_json"] = json.loads(item["extracted_json"])
+            data.append(item)
 
-        # Deterministic commands
-        if query.lower().strip() in ["show all", "show all candidates", "list all candidates"]:
-            return format_candidates(data)
-
-        # Otherwise use safe LLM reasoning
         return call_mistral_reasoner(data, query)
 
     finally:
