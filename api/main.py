@@ -239,28 +239,49 @@ async def sync_drive(payload: DriveSync):
     cursor = conn.cursor()
 
     try:
-        files = payload.files
+        drive_files = set(payload.files)
 
-        if not files:
+        if not drive_files:
             return {"status": "no files received"}
 
-        # Mark all inactive
-        cursor.execute("UPDATE candidates SET active = FALSE")
+        # Get all existing filenames
+        cursor.execute("SELECT id, cv_file_name FROM candidates")
+        db_rows = cursor.fetchall()
 
-        # Reactivate matching original filenames
-        placeholders = ",".join(["%s"] * len(files))
+        db_files = {row["cv_file_name"]: row["id"] for row in db_rows}
 
-        query = f"""
-        UPDATE candidates
-        SET active = TRUE
-        WHERE cv_file_name IN ({placeholders})
-        """
+        # Files to deactivate (exist in DB but not in Drive)
+        to_deactivate = [
+            db_files[name]
+            for name in db_files
+            if name not in drive_files
+        ]
 
-        cursor.execute(query, files)
+        # Files to activate (exist in Drive and DB)
+        to_activate = [
+            db_files[name]
+            for name in drive_files
+            if name in db_files
+        ]
+
+        if to_deactivate:
+            cursor.execute(
+                "UPDATE candidates SET active = FALSE WHERE id = ANY(%s)",
+                (to_deactivate,)
+            )
+
+        if to_activate:
+            cursor.execute(
+                "UPDATE candidates SET active = TRUE WHERE id = ANY(%s)",
+                (to_activate,)
+            )
 
         conn.commit()
 
-        return {"status": "drive synced safely", "files_received": files}
+        return {
+            "activated": len(to_activate),
+            "deactivated": len(to_deactivate)
+        }
 
     except Exception as e:
         conn.rollback()
