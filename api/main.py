@@ -63,25 +63,14 @@ def call_mistral_parser(text):
     "phones": [],
     "location": ""
   },
-  "education": [
-    {
-      "degree": "",
-      "institute": "",
-      "passout_year": ""
-    }
-  ],
+  "education": [],
   "skills": {
     "programming": [],
     "ml_keywords": [],
     "genai_keywords": [],
     "tools": []
   },
-  "projects": [
-    {
-      "title": "",
-      "summary": ""
-    }
-  ],
+  "projects": [],
   "links": {
     "github": "",
     "linkedin": "",
@@ -96,7 +85,7 @@ Extract structured CV data.
 
 STRICT RULES:
 - Return ONLY valid JSON.
-- Do NOT hallucinate fields.
+- Do NOT hallucinate.
 - If not present, return empty values.
 - Extract max 4 strongest projects.
 
@@ -135,7 +124,7 @@ CV TEXT:
 
 
 # -------------------------------------------------
-# PARSE ENDPOINT
+# PARSE ENDPOINT (CLEAN VERSION)
 # -------------------------------------------------
 
 @app.post("/parse")
@@ -156,6 +145,7 @@ async def parse(file: UploadFile):
 
         raw_text = extract_text(temp_path)
 
+        # Check candidate
         cursor.execute(
             "SELECT id FROM candidates WHERE file_hash=%s",
             (file_hash,)
@@ -180,8 +170,9 @@ async def parse(file: UploadFile):
         else:
             cursor.execute("""
                 INSERT INTO candidates
-                (name, primary_email, phone, location_text, github_url,
-                 linkedin_url, passout_year, cv_file_name, file_hash)
+                (name, primary_email, phone, location_text,
+                 github_url, linkedin_url, passout_year,
+                 cv_file_name, file_hash)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 RETURNING id
             """, (
@@ -197,7 +188,12 @@ async def parse(file: UploadFile):
             ))
             cid = cursor.fetchone()["id"]
 
-        # Store extract version
+        # ---- CLEAN OLD EXTRACTS (CRITICAL FIX) ----
+        cursor.execute(
+            "DELETE FROM cv_extracts WHERE candidate_id=%s",
+            (cid,)
+        )
+
         cursor.execute("""
             INSERT INTO cv_extracts(candidate_id, raw_text, extracted_json)
             VALUES (%s,%s,%s)
@@ -236,7 +232,7 @@ async def parse(file: UploadFile):
 
 
 # -------------------------------------------------
-# GET ALL CANDIDATES (NO DUPLICATES)
+# GET ALL CANDIDATES (CLEAN, 1 ROW PER CANDIDATE)
 # -------------------------------------------------
 
 @app.get("/candidates")
@@ -257,13 +253,7 @@ def get_candidates():
                x.extracted_json
         FROM candidates c
         JOIN evaluations e ON c.id = e.candidate_id
-        JOIN LATERAL (
-            SELECT *
-            FROM cv_extracts x
-            WHERE x.candidate_id = c.id
-            ORDER BY x.created_at DESC
-            LIMIT 1
-        ) x ON TRUE
+        JOIN cv_extracts x ON c.id = x.candidate_id
         ORDER BY c.created_at DESC
     """)
 
@@ -288,18 +278,13 @@ def get_candidates():
 
 def call_mistral_reasoner(database_json, user_query):
 
-    if not MISTRAL_KEY:
-        raise Exception("MISTRAL_API_KEY not set")
-
     prompt = f"""
 You are a CV reasoning assistant.
 
 STRICT RULES:
 - Use ONLY DATABASE_JSON.
 - Do NOT modify score or confidence.
-- Do NOT invent signals.
-- If answer cannot be derived, say:
-  "Cannot determine from database."
+- Do NOT invent data.
 
 DATABASE_JSON:
 {json.dumps(database_json, indent=2)}
@@ -323,14 +308,11 @@ Provide a clear answer.
         }
     )
 
-    if r.status_code != 200:
-        raise Exception(f"Mistral API error: {r.text}")
-
     return r.json()["choices"][0]["message"]["content"]
 
 
 # -------------------------------------------------
-# CHAT ENDPOINT (NO DUPLICATES)
+# CHAT ENDPOINT
 # -------------------------------------------------
 
 @app.get("/chat")
@@ -352,13 +334,7 @@ def chat(query: str):
                    x.extracted_json
             FROM candidates c
             JOIN evaluations e ON c.id = e.candidate_id
-            JOIN LATERAL (
-                SELECT *
-                FROM cv_extracts x
-                WHERE x.candidate_id = c.id
-                ORDER BY x.created_at DESC
-                LIMIT 1
-            ) x ON TRUE
+            JOIN cv_extracts x ON c.id = x.candidate_id
             ORDER BY c.created_at DESC
         """)
 
