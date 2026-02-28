@@ -4,7 +4,7 @@ import os
 import hashlib
 import fitz
 import requests
-import uuid  # <-- ADDED
+import uuid
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -105,20 +105,41 @@ async def parse(file: UploadFile):
 
     conn = get_connection()
     cursor = conn.cursor()
-
-    temp_path = None  # ensure defined for cleanup
+    temp_path = None
 
     try:
         original_filename = file.filename
 
-        # 🔥 SAFE UNIQUE TEMP FILE (prevents race conditions)
+        # Unique temp file
         temp_path = f"temp_{uuid.uuid4().hex}.pdf"
 
         with open(temp_path, "wb") as f:
             f.write(await file.read())
 
+        # Generate file hash
         with open(temp_path, "rb") as f:
             file_hash = hashlib.md5(f.read()).hexdigest()
+
+        # -----------------------------------------
+        # 🔥 DUPLICATE FILE CHECK (FILE HASH)
+        # -----------------------------------------
+
+        cursor.execute(
+            "SELECT id FROM candidates WHERE file_hash=%s",
+            (file_hash,)
+        )
+        existing = cursor.fetchone()
+
+        if existing:
+            conn.commit()
+            return {
+                "candidate_id": existing["id"],
+                "status": "already_processed"
+            }
+
+        # -----------------------------------------
+        # Continue only if new file
+        # -----------------------------------------
 
         raw_text = extract_text(temp_path)
         structured = call_mistral(raw_text)
@@ -141,9 +162,9 @@ async def parse(file: UploadFile):
         linkedin = data.get("linkedin")
         passout_year = data.get("passout_year")
 
-        # -----------------------------
-        # UPSERT CANDIDATE (EMAIL UNIQUE)
-        # -----------------------------
+        # -----------------------------------------
+        # UPSERT BY EMAIL
+        # -----------------------------------------
 
         cursor.execute("""
         INSERT INTO candidates
@@ -174,9 +195,9 @@ async def parse(file: UploadFile):
 
         cid = row["id"]
 
-        # -----------------------------
+        # -----------------------------------------
         # VERSIONING
-        # -----------------------------
+        # -----------------------------------------
 
         cursor.execute("""
         SELECT MAX(version) AS max_version
@@ -192,9 +213,9 @@ async def parse(file: UploadFile):
         VALUES(%s,%s,%s,%s)
         """, (cid, raw_text, structured, version))
 
-        # -----------------------------
+        # -----------------------------------------
         # BUCKETING
-        # -----------------------------
+        # -----------------------------------------
 
         signals = rule_signals(data)
         score = rule_score(signals)
@@ -223,17 +244,15 @@ async def parse(file: UploadFile):
 
         conn.commit()
 
-        return {"candidate_id": cid}
+        return {"candidate_id": cid, "status": "processed"}
 
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        # 🔥 ALWAYS CLEAN TEMP FILE SAFELY
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
-
         cursor.close()
         conn.close()
 
