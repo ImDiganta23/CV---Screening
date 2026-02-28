@@ -47,7 +47,7 @@ def extract_text(path):
 
 
 # -------------------------------------------------
-# CV PARSER (LLM for structured info only)
+# SAFE LLM CV PARSER
 # -------------------------------------------------
 
 def call_mistral_parser(text):
@@ -107,7 +107,7 @@ CV TEXT:
     end = raw.rfind("}") + 1
 
     if start == -1:
-        raise Exception("No valid JSON returned from parser")
+        raise Exception("No valid JSON returned")
 
     return raw[start:end]
 
@@ -124,7 +124,6 @@ async def parse(file: UploadFile):
     temp_path = None
 
     try:
-        original_filename = file.filename
         temp_path = f"temp_{uuid.uuid4().hex}.pdf"
 
         with open(temp_path, "wb") as f:
@@ -143,7 +142,6 @@ async def parse(file: UploadFile):
 
         if existing:
             cid = existing["id"]
-
             cursor.execute("""
                 INSERT INTO cv_extracts(candidate_id, raw_text, extracted_json)
                 VALUES (%s,%s,%s)
@@ -178,7 +176,7 @@ async def parse(file: UploadFile):
                 data.get("github"),
                 data.get("linkedin"),
                 data.get("passout_year"),
-                original_filename,
+                file.filename,
                 file_hash
             ))
 
@@ -189,18 +187,13 @@ async def parse(file: UploadFile):
                 VALUES (%s,%s,%s)
             """, (cid, raw_text, structured))
 
-        # -------- ALWAYS RE-SCORE --------
-
+        # Deterministic scoring
         signals = rule_signals(raw_text)
         score = rule_score(signals)
         bucket = bucket_from_score(score)
         confidence = round(score / 10, 2)
 
-        cursor.execute(
-            "DELETE FROM evaluations WHERE candidate_id=%s",
-            (cid,)
-        )
-
+        cursor.execute("DELETE FROM evaluations WHERE candidate_id=%s", (cid,))
         cursor.execute("""
             INSERT INTO evaluations(candidate_id, bucket, reasoning_3_bullets, confidence)
             VALUES(%s,%s,%s,%s)
@@ -213,12 +206,7 @@ async def parse(file: UploadFile):
 
         conn.commit()
 
-        return {
-            "candidate_id": cid,
-            "status": "processed_or_updated",
-            "bucket": bucket,
-            "score": score
-        }
+        return {"candidate_id": cid, "bucket": bucket, "score": score}
 
     except Exception as e:
         conn.rollback()
@@ -232,7 +220,7 @@ async def parse(file: UploadFile):
 
 
 # -------------------------------------------------
-# GET ALL CANDIDATES
+# GET ALL CANDIDATES (Raw JSON)
 # -------------------------------------------------
 
 @app.get("/candidates")
@@ -242,8 +230,7 @@ def get_candidates():
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT c.id,
-               c.name,
+        SELECT c.name,
                c.primary_email,
                c.github_url,
                c.passout_year,
@@ -263,7 +250,74 @@ def get_candidates():
 
 
 # -------------------------------------------------
-# CHAT ENDPOINT (Deterministic – NO LLM)
+# DETERMINISTIC FORMATTER
+# -------------------------------------------------
+
+def format_candidates(data):
+
+    lines = ["Here are all the candidates:\n"]
+
+    for i, row in enumerate(data, 1):
+        lines.append(f"{i}. {row['name']}")
+        lines.append(f"- Email: {row['primary_email'] or 'Not available'}")
+        lines.append(f"- GitHub: {row['github_url'] or 'Not available'}")
+        lines.append(f"- Passout Year: {row['passout_year'] or 'Not available'}")
+        lines.append(f"- Bucket: {row['bucket']}")
+        lines.append(f"- Confidence: {row['confidence']}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# -------------------------------------------------
+# SAFE LLM REASONER
+# -------------------------------------------------
+
+def call_mistral_reasoner(database_json, user_query):
+
+    if not MISTRAL_KEY:
+        raise Exception("MISTRAL_API_KEY not set")
+
+    prompt = f"""
+You are a CV reasoning assistant.
+
+STRICT RULES:
+- Use ONLY DATABASE_JSON.
+- Do NOT modify score or confidence.
+- Do NOT invent signals.
+- If answer cannot be derived, say:
+  "Cannot determine from database."
+
+DATABASE_JSON:
+{json.dumps(database_json, indent=2)}
+
+USER QUERY:
+{user_query}
+
+Provide a clear answer.
+"""
+
+    r = requests.post(
+        "https://api.mistral.ai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {MISTRAL_KEY}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": "mistral-small",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0
+        }
+    )
+
+    if r.status_code != 200:
+        raise Exception(f"Mistral API error: {r.text}")
+
+    return r.json()["choices"][0]["message"]["content"]
+
+
+# -------------------------------------------------
+# CHAT ENDPOINT (Hybrid)
 # -------------------------------------------------
 
 @app.get("/chat")
@@ -289,30 +343,16 @@ def chat(query: str):
         rows = cursor.fetchall()
 
         if not rows:
-            return "No candidates found in database."
+            return "No candidates found."
 
-        response_lines = ["Here are all the candidates from the database:\n"]
+        data = [dict(r) for r in rows]
 
-        for idx, row in enumerate(rows, start=1):
+        # Deterministic commands
+        if query.lower().strip() in ["show all", "show all candidates", "list all candidates"]:
+            return format_candidates(data)
 
-            response_lines.append(f"{idx}. {row['name']}")
-            response_lines.append(f"- Email: {row['primary_email'] or 'Not available'}")
-            response_lines.append(f"- GitHub: {row['github_url'] or 'Not available'}")
-            response_lines.append(f"- Passout Year: {row['passout_year'] or 'Not available'}")
-            response_lines.append(f"- Bucket: {row['bucket']}")
-            response_lines.append(f"- Confidence: {row['confidence']}")
-
-            reasoning = row["reasoning_3_bullets"] or ""
-
-            if reasoning:
-                response_lines.append("- Details:")
-                for line in reasoning.split("\n"):
-                    if line.strip():
-                        response_lines.append(f"- {line.strip()}")
-
-            response_lines.append("")
-
-        return "\n".join(response_lines)
+        # Otherwise use safe LLM reasoning
+        return call_mistral_reasoner(data, query)
 
     finally:
         cursor.close()
