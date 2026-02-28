@@ -108,7 +108,7 @@ async def parse(file: UploadFile):
     try:
         original_filename = file.filename
 
-        # temp file for processing only
+        # temp file only for processing
         temp_path = f"temp_{hashlib.md5(original_filename.encode()).hexdigest()}.pdf"
 
         with open(temp_path, "wb") as f:
@@ -139,29 +139,35 @@ async def parse(file: UploadFile):
         passout_year = data.get("passout_year")
 
         # -----------------------------
-        # INSERT CANDIDATE (store ORIGINAL filename)
+        # UPSERT CANDIDATE (EMAIL UNIQUE)
         # -----------------------------
 
         cursor.execute("""
         INSERT INTO candidates
-        (name, primary_email, phone, location_text, github_url,
-         linkedin_url, passout_year, cv_file_name, file_hash)
+        (name, primary_email, phone, location_text, github_url, linkedin_url,
+         passout_year, cv_file_name, file_hash)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        ON CONFLICT (file_hash) DO NOTHING
+        ON CONFLICT (primary_email)
+        DO UPDATE SET
+            name = EXCLUDED.name,
+            phone = EXCLUDED.phone,
+            location_text = EXCLUDED.location_text,
+            github_url = EXCLUDED.github_url,
+            linkedin_url = EXCLUDED.linkedin_url,
+            passout_year = EXCLUDED.passout_year,
+            cv_file_name = EXCLUDED.cv_file_name,
+            file_hash = EXCLUDED.file_hash,
+            active = TRUE
+        RETURNING id
         """, (
             name, email, phone, location,
             github, linkedin, passout_year,
             original_filename, file_hash
         ))
 
-        cursor.execute(
-            "SELECT id FROM candidates WHERE file_hash=%s",
-            (file_hash,)
-        )
         row = cursor.fetchone()
-
         if not row:
-            raise HTTPException(status_code=500, detail="Candidate lookup failed")
+            raise HTTPException(status_code=500, detail="Candidate insert/update failed")
 
         cid = row["id"]
 
@@ -179,7 +185,7 @@ async def parse(file: UploadFile):
         version = (row["max_version"] + 1) if row and row["max_version"] else 1
 
         cursor.execute("""
-        INSERT INTO cv_extracts(candidate_id,raw_text,extracted_json,version)
+        INSERT INTO cv_extracts(candidate_id, raw_text, extracted_json, version)
         VALUES(%s,%s,%s,%s)
         """, (cid, raw_text, structured, version))
 
@@ -198,7 +204,7 @@ async def parse(file: UploadFile):
         )
 
         cursor.execute("""
-        INSERT INTO evaluations(candidate_id,bucket,reasoning_3_bullets,confidence)
+        INSERT INTO evaluations(candidate_id, bucket, reasoning_3_bullets, confidence)
         VALUES(%s,%s,%s,%s)
         """, (
             cid,
@@ -213,7 +219,9 @@ async def parse(file: UploadFile):
         )
 
         conn.commit()
-        os.remove(temp_path)
+
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
         return {"candidate_id": cid}
 
@@ -244,20 +252,17 @@ async def sync_drive(payload: DriveSync):
         if not drive_files:
             return {"status": "no files received"}
 
-        # Get all existing filenames
         cursor.execute("SELECT id, cv_file_name FROM candidates")
         db_rows = cursor.fetchall()
 
         db_files = {row["cv_file_name"]: row["id"] for row in db_rows}
 
-        # Files to deactivate (exist in DB but not in Drive)
         to_deactivate = [
             db_files[name]
             for name in db_files
             if name not in drive_files
         ]
 
-        # Files to activate (exist in Drive and DB)
         to_activate = [
             db_files[name]
             for name in drive_files
