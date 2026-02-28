@@ -47,7 +47,7 @@ def extract_text(path):
 
 
 # -------------------------------------------------
-# ENHANCED LLM CV PARSER (PROJECT GUIDELINE COMPLIANT)
+# ENHANCED LLM CV PARSER
 # -------------------------------------------------
 
 def call_mistral_parser(text):
@@ -97,10 +97,8 @@ Extract structured CV data.
 STRICT RULES:
 - Return ONLY valid JSON.
 - Do NOT hallucinate fields.
-- If information is not present, return empty string or empty list.
-- Extract 2-4 strongest projects only.
-- Evidence hints include keywords like:
-  deployed, api, llm, rag, fastapi, automation, docker, streamlit
+- If not present, return empty values.
+- Extract max 4 strongest projects.
 
 Schema:
 {schema}
@@ -137,7 +135,7 @@ CV TEXT:
 
 
 # -------------------------------------------------
-# PARSE ENDPOINT (Production Safe + Full Extraction)
+# PARSE ENDPOINT
 # -------------------------------------------------
 
 @app.post("/parse")
@@ -167,7 +165,6 @@ async def parse(file: UploadFile):
         structured = call_mistral_parser(raw_text)
         structured_json = json.loads(structured)
 
-        # Extract normalized fields
         candidate = structured_json.get("candidate", {})
         links = structured_json.get("links", {})
 
@@ -198,7 +195,6 @@ async def parse(file: UploadFile):
                 file.filename,
                 file_hash
             ))
-
             cid = cursor.fetchone()["id"]
 
         # Store extract version
@@ -240,7 +236,7 @@ async def parse(file: UploadFile):
 
 
 # -------------------------------------------------
-# GET ALL CANDIDATES (With Structured JSON)
+# GET ALL CANDIDATES (NO DUPLICATES)
 # -------------------------------------------------
 
 @app.get("/candidates")
@@ -261,7 +257,13 @@ def get_candidates():
                x.extracted_json
         FROM candidates c
         JOIN evaluations e ON c.id = e.candidate_id
-        JOIN cv_extracts x ON c.id = x.candidate_id
+        JOIN LATERAL (
+            SELECT *
+            FROM cv_extracts x
+            WHERE x.candidate_id = c.id
+            ORDER BY x.created_at DESC
+            LIMIT 1
+        ) x ON TRUE
         ORDER BY c.created_at DESC
     """)
 
@@ -328,7 +330,7 @@ Provide a clear answer.
 
 
 # -------------------------------------------------
-# CHAT ENDPOINT
+# CHAT ENDPOINT (NO DUPLICATES)
 # -------------------------------------------------
 
 @app.get("/chat")
@@ -350,7 +352,13 @@ def chat(query: str):
                    x.extracted_json
             FROM candidates c
             JOIN evaluations e ON c.id = e.candidate_id
-            JOIN cv_extracts x ON c.id = x.candidate_id
+            JOIN LATERAL (
+                SELECT *
+                FROM cv_extracts x
+                WHERE x.candidate_id = c.id
+                ORDER BY x.created_at DESC
+                LIMIT 1
+            ) x ON TRUE
             ORDER BY c.created_at DESC
         """)
 
