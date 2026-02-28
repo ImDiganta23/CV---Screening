@@ -46,11 +46,14 @@ def extract_text(path):
     return "".join([p.get_text() for p in doc])
 
 
-# -----------------------------
-# CV PARSER (LLM Extraction)
-# -----------------------------
+# -------------------------------------------------
+# CV PARSER (LLM for structured info only)
+# -------------------------------------------------
 
 def call_mistral_parser(text):
+
+    if not MISTRAL_KEY:
+        raise Exception("MISTRAL_API_KEY not set")
 
     schema = """
 {
@@ -63,8 +66,7 @@ def call_mistral_parser(text):
   "passout_year": null,
   "education": "",
   "projects": [],
-  "skills": [],
-  "evidence_hints": []
+  "skills": []
 }
 """
 
@@ -73,69 +75,14 @@ Extract structured CV data.
 
 Rules:
 - Return ONLY valid JSON.
-- Do NOT hallucinate email or phone.
-- If email or phone is not explicitly present in text, return null.
-- Do NOT invent links.
-- Keep projects concise (title + 1–2 line summary).
+- Do NOT hallucinate fields.
+- If not explicitly present, return null.
 
 Schema:
 {schema}
 
 CV TEXT:
 {text}
-"""
-
-    r = requests.post(
-        "https://api.mistral.ai/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {MISTRAL_KEY}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": "mistral-small",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2
-        }
-    )
-
-    if r.status_code != 200:
-        raise Exception(f"Mistral API error: {r.text}")
-
-    raw = r.json()["choices"][0]["message"]["content"]
-
-    start = raw.find("{")
-    end = raw.rfind("}") + 1
-
-    if start == -1:
-        raise Exception("No valid JSON returned from parser")
-
-    return raw[start:end]
-
-
-# -----------------------------
-# CHAT FORMATTER (SAFE MODE)
-# -----------------------------
-
-def call_mistral_formatter(database_json, user_query):
-
-    prompt = f"""
-You are a formatting assistant.
-
-STRICT RULES:
-- Use ONLY the data provided in DATABASE_JSON.
-- Do NOT add new candidates.
-- Do NOT invent missing values.
-- If information is missing, say "Not available".
-- If query cannot be answered from data, reply:
-  "No matching data found in database."
-
-USER QUERY:
-{user_query}
-
-DATABASE_JSON:
-{json.dumps(database_json, indent=2)}
-
-Return a clean, well-formatted chat-style response.
 """
 
     r = requests.post(
@@ -154,11 +101,19 @@ Return a clean, well-formatted chat-style response.
     if r.status_code != 200:
         raise Exception(f"Mistral API error: {r.text}")
 
-    return r.json()["choices"][0]["message"]["content"]
+    raw = r.json()["choices"][0]["message"]["content"]
+
+    start = raw.find("{")
+    end = raw.rfind("}") + 1
+
+    if start == -1:
+        raise Exception("No valid JSON returned from parser")
+
+    return raw[start:end]
 
 
 # -------------------------------------------------
-# PARSE ENDPOINT (Called by n8n)
+# PARSE ENDPOINT (Production Safe)
 # -------------------------------------------------
 
 @app.post("/parse")
@@ -175,14 +130,11 @@ async def parse(file: UploadFile):
         with open(temp_path, "wb") as f:
             f.write(await file.read())
 
-        # Generate file hash (duplicate detection)
         with open(temp_path, "rb") as f:
             file_hash = hashlib.md5(f.read()).hexdigest()
 
-        # Extract raw text
         raw_text = extract_text(temp_path)
 
-        # Check if candidate already exists
         cursor.execute(
             "SELECT id FROM candidates WHERE file_hash=%s",
             (file_hash,)
@@ -190,23 +142,14 @@ async def parse(file: UploadFile):
         existing = cursor.fetchone()
 
         if existing:
-            # -----------------------------
-            # Candidate exists → UPDATE FLOW
-            # -----------------------------
             cid = existing["id"]
 
-            # Store new extract version
             cursor.execute("""
                 INSERT INTO cv_extracts(candidate_id, raw_text, extracted_json)
                 VALUES (%s,%s,%s)
             """, (cid, raw_text, None))
 
         else:
-            # -----------------------------
-            # New Candidate → INSERT FLOW
-            # -----------------------------
-
-            # Minimal structured extraction (optional)
             structured = call_mistral_parser(raw_text)
             data = json.loads(structured)
 
@@ -243,19 +186,16 @@ async def parse(file: UploadFile):
 
             cursor.execute("""
                 INSERT INTO cv_extracts(candidate_id, raw_text, extracted_json)
-                VALUES(%s,%s,%s)
+                VALUES (%s,%s,%s)
             """, (cid, raw_text, structured))
 
-        # -------------------------------------------------
-        # ALWAYS RE-SCORE (deterministic raw text scoring)
-        # -------------------------------------------------
+        # -------- ALWAYS RE-SCORE --------
 
         signals = rule_signals(raw_text)
         score = rule_score(signals)
         bucket = bucket_from_score(score)
-        confidence = round(min(1.0, score / 10), 2)
+        confidence = round(score / 10, 2)
 
-        # Remove old evaluation if exists
         cursor.execute(
             "DELETE FROM evaluations WHERE candidate_id=%s",
             (cid,)
@@ -290,8 +230,9 @@ async def parse(file: UploadFile):
         cursor.close()
         conn.close()
 
+
 # -------------------------------------------------
-# GET ALL CANDIDATES (Raw JSON)
+# GET ALL CANDIDATES
 # -------------------------------------------------
 
 @app.get("/candidates")
@@ -301,17 +242,17 @@ def get_candidates():
     cursor = conn.cursor()
 
     cursor.execute("""
-    SELECT c.id,
-           c.name,
-           c.primary_email,
-           c.github_url,
-           c.passout_year,
-           e.bucket,
-           e.reasoning_3_bullets,
-           e.confidence
-    FROM candidates c
-    JOIN evaluations e ON c.id = e.candidate_id
-    ORDER BY c.created_at DESC
+        SELECT c.id,
+               c.name,
+               c.primary_email,
+               c.github_url,
+               c.passout_year,
+               e.bucket,
+               e.reasoning_3_bullets,
+               e.confidence
+        FROM candidates c
+        JOIN evaluations e ON c.id = e.candidate_id
+        ORDER BY c.created_at DESC
     """)
 
     rows = cursor.fetchall()
@@ -322,7 +263,7 @@ def get_candidates():
 
 
 # -------------------------------------------------
-# CHAT ENDPOINT (DB → LLM FORMAT ONLY)
+# CHAT ENDPOINT (Deterministic – NO LLM)
 # -------------------------------------------------
 
 @app.get("/chat")
@@ -333,16 +274,16 @@ def chat(query: str):
 
     try:
         cursor.execute("""
-        SELECT c.name,
-               c.primary_email,
-               c.github_url,
-               c.passout_year,
-               e.bucket,
-               e.reasoning_3_bullets,
-               e.confidence
-        FROM candidates c
-        JOIN evaluations e ON c.id = e.candidate_id
-        ORDER BY c.created_at DESC
+            SELECT c.name,
+                   c.primary_email,
+                   c.github_url,
+                   c.passout_year,
+                   e.bucket,
+                   e.reasoning_3_bullets,
+                   e.confidence
+            FROM candidates c
+            JOIN evaluations e ON c.id = e.candidate_id
+            ORDER BY c.created_at DESC
         """)
 
         rows = cursor.fetchall()
@@ -350,11 +291,28 @@ def chat(query: str):
         if not rows:
             return "No candidates found in database."
 
-        database_data = [dict(r) for r in rows]
+        response_lines = ["Here are all the candidates from the database:\n"]
 
-        formatted_response = call_mistral_formatter(database_data, query)
+        for idx, row in enumerate(rows, start=1):
 
-        return formatted_response
+            response_lines.append(f"{idx}. {row['name']}")
+            response_lines.append(f"- Email: {row['primary_email'] or 'Not available'}")
+            response_lines.append(f"- GitHub: {row['github_url'] or 'Not available'}")
+            response_lines.append(f"- Passout Year: {row['passout_year'] or 'Not available'}")
+            response_lines.append(f"- Bucket: {row['bucket']}")
+            response_lines.append(f"- Confidence: {row['confidence']}")
+
+            reasoning = row["reasoning_3_bullets"] or ""
+
+            if reasoning:
+                response_lines.append("- Details:")
+                for line in reasoning.split("\n"):
+                    if line.strip():
+                        response_lines.append(f"- {line.strip()}")
+
+            response_lines.append("")
+
+        return "\n".join(response_lines)
 
     finally:
         cursor.close()
