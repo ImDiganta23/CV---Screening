@@ -13,16 +13,21 @@ def get_connection():
         cursor_factory=RealDictCursor
     )
 
-# ---- INITIALIZE DATABASE (RUN ON STARTUP) ---- #
+# -------------------------------------------------
+# INITIALIZE DATABASE
+# -------------------------------------------------
 
 def init_db():
     conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
 
-    # Candidates table
+    # -----------------------------
+    # Candidates Table
+    # -----------------------------
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS candidates(
         id SERIAL PRIMARY KEY,
+        drive_file_id TEXT UNIQUE,
         name TEXT,
         primary_email TEXT UNIQUE,
         phone TEXT,
@@ -30,7 +35,7 @@ def init_db():
         linkedin_url TEXT,
         github_url TEXT,
         passout_year INTEGER,
-        cv_file_name TEXT UNIQUE,
+        cv_file_name TEXT,
         file_hash TEXT UNIQUE,
         status TEXT DEFAULT 'processed',
         active BOOLEAN DEFAULT TRUE,
@@ -38,12 +43,9 @@ def init_db():
     )
     """)
 
-    cursor.execute("""
-    ALTER TABLE candidates
-    ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE
-    """)
-
-    # CV Extracts table
+    # -----------------------------
+    # CV Extracts Table
+    # -----------------------------
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS cv_extracts(
         id SERIAL PRIMARY KEY,
@@ -55,7 +57,9 @@ def init_db():
     )
     """)
 
-    # Evaluations table
+    # -----------------------------
+    # Evaluations Table
+    # -----------------------------
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS evaluations(
         id SERIAL PRIMARY KEY,
@@ -67,7 +71,7 @@ def init_db():
     )
     """)
 
-    # Indexes (performance)
+    # Indexes
     cursor.execute("""
     CREATE INDEX IF NOT EXISTS idx_candidate_hash
     ON candidates(file_hash)
@@ -82,8 +86,7 @@ def init_db():
     cursor.close()
     conn.close()
 
-    print("PostgreSQL initialized")
-
+    print("PostgreSQL initialized successfully")
 
 # Run initialization
 init_db()

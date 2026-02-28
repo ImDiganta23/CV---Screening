@@ -10,16 +10,18 @@ from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
 from api.bucketer import rule_score, bucket_from_score, rule_signals
 from api.db import get_connection
 
 load_dotenv()
 
 MISTRAL_KEY = os.getenv("MISTRAL_API_KEY")
-print("MISTRAL KEY LOADED:", bool(MISTRAL_KEY))
 
 app = FastAPI()
+
+# -------------------------------------------------
+# FRONTEND
+# -------------------------------------------------
 
 app.mount("/static", StaticFiles(directory="Frontend"), name="static")
 
@@ -43,32 +45,33 @@ def extract_text(path):
     doc = fitz.open(path)
     return "".join([p.get_text() for p in doc])
 
-def call_mistral(text):
-
-    schema = """
-{
-  "name": "",
-  "email": "",
-  "phone": "",
-  "location": "",
-  "github": "",
-  "linkedin": "",
-  "passout_year": null,
-  "education": "",
-  "projects": [],
-  "skills": [],
-  "evidence_hints": []
-}
-"""
+def call_mistral_formatter(database_json, user_query):
+    """
+    STRICT FORMATTER MODE
+    LLM is NOT allowed to invent or add data.
+    It can only reformat the given JSON.
+    """
 
     prompt = f"""
-Return ONLY valid JSON.
+You are a formatting assistant.
 
-Schema:
-{schema}
+IMPORTANT RULES:
+- Use ONLY the data provided in DATABASE_JSON.
+- Do NOT add new candidates.
+- Do NOT assume missing values.
+- Do NOT generate information not present.
+- If something is missing, say "Not available".
+- Do NOT invent anything.
+- If the query cannot be answered from the data, reply:
+  "No matching data found in database."
 
-CV TEXT:
-{text}
+USER QUERY:
+{user_query}
+
+DATABASE_JSON:
+{json.dumps(database_json, indent=2)}
+
+Return a clean, well-formatted chat-style response.
 """
 
     r = requests.post(
@@ -79,22 +82,15 @@ CV TEXT:
         },
         json={
             "model": "mistral-small",
-            "messages": [{"role": "user", "content": prompt}]
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0  # 🔒 prevents creative generation
         }
     )
 
     if r.status_code != 200:
         raise Exception(f"Mistral API error: {r.text}")
 
-    raw = r.json()["choices"][0]["message"]["content"]
-
-    start = raw.find("{")
-    end = raw.rfind("}") + 1
-
-    if start == -1:
-        raise Exception("No JSON returned")
-
-    return raw[start:end]
+    return r.json()["choices"][0]["message"]["content"]
 
 # -------------------------------------------------
 # PARSE ENDPOINT
@@ -109,21 +105,15 @@ async def parse(file: UploadFile):
 
     try:
         original_filename = file.filename
-
-        # Unique temp file
         temp_path = f"temp_{uuid.uuid4().hex}.pdf"
 
         with open(temp_path, "wb") as f:
             f.write(await file.read())
 
-        # Generate file hash
         with open(temp_path, "rb") as f:
             file_hash = hashlib.md5(f.read()).hexdigest()
 
-        # -----------------------------------------
-        # 🔥 DUPLICATE FILE CHECK (FILE HASH)
-        # -----------------------------------------
-
+        # Prevent duplicate parsing
         cursor.execute(
             "SELECT id FROM candidates WHERE file_hash=%s",
             (file_hash,)
@@ -131,57 +121,28 @@ async def parse(file: UploadFile):
         existing = cursor.fetchone()
 
         if existing:
-            conn.commit()
             return {
                 "candidate_id": existing["id"],
                 "status": "already_processed"
             }
 
-        # -----------------------------------------
-        # Continue only if new file
-        # -----------------------------------------
-
         raw_text = extract_text(temp_path)
-        structured = call_mistral(raw_text)
+        structured = call_mistral_formatter({}, raw_text)  # Not used for parsing
         data = json.loads(structured)
 
         name = data.get("name")
         email = data.get("email")
         phone = data.get("phone")
-
-        EMAIL_REGEX = r"^[^@]+@[^@]+\.[^@]+$"
-        PHONE_REGEX = r"\+?\d{7,15}"
-
-        if email and not re.match(EMAIL_REGEX, email):
-            email = None
-        if phone and not re.match(PHONE_REGEX, phone):
-            phone = None
-
         location = data.get("location")
         github = data.get("github")
         linkedin = data.get("linkedin")
         passout_year = data.get("passout_year")
 
-        # -----------------------------------------
-        # UPSERT BY EMAIL
-        # -----------------------------------------
-
         cursor.execute("""
         INSERT INTO candidates
-        (name, primary_email, phone, location_text, github_url, linkedin_url,
-         passout_year, cv_file_name, file_hash)
+        (name, primary_email, phone, location_text, github_url,
+         linkedin_url, passout_year, cv_file_name, file_hash)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        ON CONFLICT (primary_email)
-        DO UPDATE SET
-            name = EXCLUDED.name,
-            phone = EXCLUDED.phone,
-            location_text = EXCLUDED.location_text,
-            github_url = EXCLUDED.github_url,
-            linkedin_url = EXCLUDED.linkedin_url,
-            passout_year = EXCLUDED.passout_year,
-            cv_file_name = EXCLUDED.cv_file_name,
-            file_hash = EXCLUDED.file_hash,
-            active = TRUE
         RETURNING id
         """, (
             name, email, phone, location,
@@ -189,43 +150,17 @@ async def parse(file: UploadFile):
             original_filename, file_hash
         ))
 
-        row = cursor.fetchone()
-        if not row:
-            raise HTTPException(status_code=500, detail="Candidate insert/update failed")
-
-        cid = row["id"]
-
-        # -----------------------------------------
-        # VERSIONING
-        # -----------------------------------------
+        cid = cursor.fetchone()["id"]
 
         cursor.execute("""
-        SELECT MAX(version) AS max_version
-        FROM cv_extracts
-        WHERE candidate_id=%s
-        """, (cid,))
-
-        row = cursor.fetchone()
-        version = (row["max_version"] + 1) if row and row["max_version"] else 1
-
-        cursor.execute("""
-        INSERT INTO cv_extracts(candidate_id, raw_text, extracted_json, version)
-        VALUES(%s,%s,%s,%s)
-        """, (cid, raw_text, structured, version))
-
-        # -----------------------------------------
-        # BUCKETING
-        # -----------------------------------------
+        INSERT INTO cv_extracts(candidate_id, raw_text, extracted_json)
+        VALUES(%s,%s,%s)
+        """, (cid, raw_text, structured))
 
         signals = rule_signals(data)
         score = rule_score(signals)
         bucket = bucket_from_score(score)
         confidence = round(min(1.0, score / 10), 2)
-
-        cursor.execute(
-            "DELETE FROM evaluations WHERE candidate_id=%s",
-            (cid,)
-        )
 
         cursor.execute("""
         INSERT INTO evaluations(candidate_id, bucket, reasoning_3_bullets, confidence)
@@ -233,14 +168,9 @@ async def parse(file: UploadFile):
         """, (
             cid,
             bucket,
-            f"Rule score: {score}\nML detected: {signals.get('has_ml')}\nDeployment detected: {signals.get('has_deployment')}",
+            f"Rule score: {score}",
             confidence
         ))
-
-        cursor.execute(
-            "UPDATE candidates SET status='processed', active=TRUE WHERE id=%s",
-            (cid,)
-        )
 
         conn.commit()
 
@@ -257,82 +187,18 @@ async def parse(file: UploadFile):
         conn.close()
 
 # -------------------------------------------------
-# SAFE DRIVE SYNC
+# CHAT ENDPOINT (DB → LLM FORMAT ONLY)
 # -------------------------------------------------
 
-class DriveSync(BaseModel):
-    files: list[str]
-
-@app.post("/sync_drive")
-async def sync_drive(payload: DriveSync):
-
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    try:
-        drive_files = set(payload.files)
-
-        if not drive_files:
-            return {"status": "no files received"}
-
-        cursor.execute("SELECT id, cv_file_name FROM candidates")
-        db_rows = cursor.fetchall()
-
-        db_files = {row["cv_file_name"]: row["id"] for row in db_rows}
-
-        to_deactivate = [
-            db_files[name]
-            for name in db_files
-            if name not in drive_files
-        ]
-
-        to_activate = [
-            db_files[name]
-            for name in drive_files
-            if name in db_files
-        ]
-
-        if to_deactivate:
-            cursor.execute(
-                "UPDATE candidates SET active = FALSE WHERE id = ANY(%s)",
-                (to_deactivate,)
-            )
-
-        if to_activate:
-            cursor.execute(
-                "UPDATE candidates SET active = TRUE WHERE id = ANY(%s)",
-                (to_activate,)
-            )
-
-        conn.commit()
-
-        return {
-            "activated": len(to_activate),
-            "deactivated": len(to_deactivate)
-        }
-
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        cursor.close()
-        conn.close()
-
-# -------------------------------------------------
-# GET CANDIDATES
-# -------------------------------------------------
-
-@app.get("/candidates")
-def get_candidates():
+@app.get("/chat")
+def chat(query: str):
 
     conn = get_connection()
     cursor = conn.cursor()
 
     try:
         cursor.execute("""
-        SELECT c.id AS candidate_id,
-               c.name,
+        SELECT c.name,
                c.primary_email,
                c.github_url,
                c.passout_year,
@@ -341,11 +207,21 @@ def get_candidates():
                e.confidence
         FROM candidates c
         JOIN evaluations e ON c.id = e.candidate_id
-        WHERE c.active = TRUE
+        ORDER BY c.created_at DESC
         """)
 
         rows = cursor.fetchall()
-        return [dict(r) for r in rows]
+
+        if not rows:
+            return "No candidates found in database."
+
+        # Convert to plain dict list
+        database_data = [dict(r) for r in rows]
+
+        # Pass ONLY database data to LLM
+        formatted_response = call_mistral_formatter(database_data, query)
+
+        return formatted_response
 
     finally:
         cursor.close()
