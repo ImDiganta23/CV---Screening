@@ -4,6 +4,7 @@ import os
 import hashlib
 import fitz
 import requests
+import uuid  # <-- ADDED
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -105,11 +106,13 @@ async def parse(file: UploadFile):
     conn = get_connection()
     cursor = conn.cursor()
 
+    temp_path = None  # ensure defined for cleanup
+
     try:
         original_filename = file.filename
 
-        # temp file only for processing
-        temp_path = f"temp_{hashlib.md5(original_filename.encode()).hexdigest()}.pdf"
+        # 🔥 SAFE UNIQUE TEMP FILE (prevents race conditions)
+        temp_path = f"temp_{uuid.uuid4().hex}.pdf"
 
         with open(temp_path, "wb") as f:
             f.write(await file.read())
@@ -220,9 +223,6 @@ async def parse(file: UploadFile):
 
         conn.commit()
 
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
         return {"candidate_id": cid}
 
     except Exception as e:
@@ -230,6 +230,10 @@ async def parse(file: UploadFile):
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
+        # 🔥 ALWAYS CLEAN TEMP FILE SAFELY
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
         cursor.close()
         conn.close()
 
