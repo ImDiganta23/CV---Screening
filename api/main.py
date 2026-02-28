@@ -175,10 +175,14 @@ async def parse(file: UploadFile):
         with open(temp_path, "wb") as f:
             f.write(await file.read())
 
-        # Generate file hash (duplicate protection)
+        # Generate file hash (duplicate detection)
         with open(temp_path, "rb") as f:
             file_hash = hashlib.md5(f.read()).hexdigest()
 
+        # Extract raw text
+        raw_text = extract_text(temp_path)
+
+        # Check if candidate already exists
         cursor.execute(
             "SELECT id FROM candidates WHERE file_hash=%s",
             (file_hash,)
@@ -186,62 +190,80 @@ async def parse(file: UploadFile):
         existing = cursor.fetchone()
 
         if existing:
-            return {
-                "candidate_id": existing["id"],
-                "status": "already_processed"
-            }
+            # -----------------------------
+            # Candidate exists → UPDATE FLOW
+            # -----------------------------
+            cid = existing["id"]
 
-        raw_text = extract_text(temp_path)
-        structured = call_mistral_parser(raw_text)
-        data = json.loads(structured)
+            # Store new extract version
+            cursor.execute("""
+                INSERT INTO cv_extracts(candidate_id, raw_text, extracted_json)
+                VALUES (%s,%s,%s)
+            """, (cid, raw_text, None))
 
-        # Validate email & phone
-        email = data.get("email")
-        phone = data.get("phone")
+        else:
+            # -----------------------------
+            # New Candidate → INSERT FLOW
+            # -----------------------------
 
-        EMAIL_REGEX = r"^[^@]+@[^@]+\.[^@]+$"
-        PHONE_REGEX = r"\+?\d{7,15}"
+            # Minimal structured extraction (optional)
+            structured = call_mistral_parser(raw_text)
+            data = json.loads(structured)
 
-        if email and not re.match(EMAIL_REGEX, email):
-            email = None
-        if phone and not re.match(PHONE_REGEX, phone):
-            phone = None
+            email = data.get("email")
+            phone = data.get("phone")
 
-        cursor.execute("""
-        INSERT INTO candidates
-        (name, primary_email, phone, location_text, github_url,
-         linkedin_url, passout_year, cv_file_name, file_hash)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        RETURNING id
-        """, (
-            data.get("name"),
-            email,
-            phone,
-            data.get("location"),
-            data.get("github"),
-            data.get("linkedin"),
-            data.get("passout_year"),
-            original_filename,
-            file_hash
-        ))
+            EMAIL_REGEX = r"^[^@]+@[^@]+\.[^@]+$"
+            PHONE_REGEX = r"\+?\d{7,15}"
 
-        cid = cursor.fetchone()["id"]
+            if email and not re.match(EMAIL_REGEX, email):
+                email = None
+            if phone and not re.match(PHONE_REGEX, phone):
+                phone = None
 
-        # Store extract
-        cursor.execute("""
-        INSERT INTO cv_extracts(candidate_id, raw_text, extracted_json)
-        VALUES(%s,%s,%s)
-        """, (cid, raw_text, structured))
+            cursor.execute("""
+                INSERT INTO candidates
+                (name, primary_email, phone, location_text, github_url,
+                 linkedin_url, passout_year, cv_file_name, file_hash)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING id
+            """, (
+                data.get("name"),
+                email,
+                phone,
+                data.get("location"),
+                data.get("github"),
+                data.get("linkedin"),
+                data.get("passout_year"),
+                original_filename,
+                file_hash
+            ))
 
-        # Run bucketer
+            cid = cursor.fetchone()["id"]
+
+            cursor.execute("""
+                INSERT INTO cv_extracts(candidate_id, raw_text, extracted_json)
+                VALUES(%s,%s,%s)
+            """, (cid, raw_text, structured))
+
+        # -------------------------------------------------
+        # ALWAYS RE-SCORE (deterministic raw text scoring)
+        # -------------------------------------------------
+
         signals = rule_signals(raw_text)
         score = rule_score(signals)
         bucket = bucket_from_score(score)
         confidence = round(min(1.0, score / 10), 2)
 
+        # Remove old evaluation if exists
+        cursor.execute(
+            "DELETE FROM evaluations WHERE candidate_id=%s",
+            (cid,)
+        )
+
         cursor.execute("""
-        INSERT INTO evaluations(candidate_id, bucket, reasoning_3_bullets, confidence)
-        VALUES(%s,%s,%s,%s)
+            INSERT INTO evaluations(candidate_id, bucket, reasoning_3_bullets, confidence)
+            VALUES(%s,%s,%s,%s)
         """, (
             cid,
             bucket,
@@ -251,7 +273,12 @@ async def parse(file: UploadFile):
 
         conn.commit()
 
-        return {"candidate_id": cid, "status": "processed"}
+        return {
+            "candidate_id": cid,
+            "status": "processed_or_updated",
+            "bucket": bucket,
+            "score": score
+        }
 
     except Exception as e:
         conn.rollback()
@@ -262,7 +289,6 @@ async def parse(file: UploadFile):
             os.remove(temp_path)
         cursor.close()
         conn.close()
-
 
 # -------------------------------------------------
 # GET ALL CANDIDATES (Raw JSON)
